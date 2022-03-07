@@ -2,7 +2,8 @@ import numpy as np
 import numba as nb
 from numba import int64, float32, float64, int32
 
-@nb.jit(nopython=True)
+
+@nb.jit(nopython=True, fastmath=True)
 def _squeeze_output(out):
     """
     Remove single-dimensional entries from array and convert to scalar,
@@ -14,7 +15,8 @@ def _squeeze_output(out):
         out = out[()]
     return out
 
-@nb.jit(nopython=True)
+
+@nb.jit(nopython=True, fastmath=True)
 def normal_logpdf(x, mu, cov):
     """
     Multivariate normal logpdf, numpy native implementation
@@ -28,17 +30,17 @@ def normal_logpdf(x, mu, cov):
     return float(np.log(part1) + part2)
 
 
-@nb.jit(nopython=True)
+@nb.jit(nopython=True, fastmath=True)
 def invwishartrand_prec(nu, phi):
     return np.linalg.inv(wishartrand(nu, phi))
 
 
-@nb.jit(nopython=True)
+@nb.jit(nopython=True, fastmath=True)
 def invwishartrand(nu, phi):
     return np.linalg.inv(wishartrand(nu, np.linalg.inv(phi)))
 
 
-@nb.jit(nopython=True)
+@nb.jit(nopython=True, fastmath=True)
 def wishartrand(nu, phi):
     dim = phi.shape[0]
     chol = np.linalg.cholesky(phi)
@@ -80,7 +82,7 @@ def gammaln(z):
     return out
 
 
-@nb.jit(nopython=True)
+@nb.jit(nopython=True, fastmath=True)
 def t_logpdf(x, loc, cov, df):
     """
     Utility method `pdf`, `logpdf` for parameters.

@@ -35,14 +35,34 @@ class GaussianMixture:
         # likelihood of its component
         # an Ndata x 2 matrix of data points
         if isinstance(self.sd, (float, int)):
-            self.sd = np.array([np.array([[self.sd, 0],[0, self.sd]]) for i in range(self.rho)])
+            self.sd = np.array([np.array([[self.sd, 0],[0, self.sd]]) for i in range(len(self.rho))])
 
         x = np.array([st.multivariate_normal(self.mu[z[i], :], self.sd[z[i]]).rvs(size=1) for i in range(len(z))]).T
         return x.T
 
 
-@nb.jit(nopython=True)
-def run_mcmc(data: np.ndarray, alpha: float = None, max_iter: int = 1000, sd: float = 1, sig0: float = 3.0):
+class DPMM:
+    def __init__(self, data):
+        self.data = data
+        self.z = None  # array of cluster indices
+        self.probs = None  # dictionary of probabilities of given point to belong to a cluster
+        self.alphas = None  # draws from Gibbs sampler for alpha
+        self.cluster_means = None
+        self.cluster_cov = None
+
+    def run_mcmc(self, specification, iter, **kwargs):
+        if specification == "normal":
+            self.z, self.probs, self.alphas, self.cluster_means, self.cluster_cov = run_mcmc(self.data,
+                                                                                             max_iter=iter, **kwargs)
+        elif specification == "normal_invwishart":
+            self.z, self.probs, self.alphas, self.cluster_means, self.cluster_cov = run_mcmc_mvn_normal_invwishart(
+                self.data, max_iter=iter, **kwargs)
+        else:
+            raise NotImplementedError
+
+
+@nb.jit(nopython=True, fastmath=True)
+def run_mcmc(data: np.ndarray, alpha: float = None, max_iter: int = 1000, sd: float = 1, sig0: float = 3.0, a_gamma: float =None, b_gamma: float =None):
     """
     Fast implementation of the algorithm 3 of Neal (2000) with extension to hyperparameter inference for alpha
 
@@ -53,6 +73,12 @@ def run_mcmc(data: np.ndarray, alpha: float = None, max_iter: int = 1000, sd: fl
     :param sig0: prior covariance
     :return:
     """
+    # Defaults
+    infer_alpha = True if alpha is None else False
+    alpha = 0.01 if alpha is None else alpha
+    a_gamma = 2 if a_gamma is None else a_gamma
+    b_gamma = 4 if b_gamma is None else b_gamma
+
 
     final_loc_probs = {}
     data_dim = data.shape[1]  # dimension of the data points
@@ -66,10 +92,8 @@ def run_mcmc(data: np.ndarray, alpha: float = None, max_iter: int = 1000, sd: fl
     counts = np.array([data.shape[0]])
     n_clusters = len(counts)
     pi_choice = np.random.uniform(0.0, 1.0, size=max_iter)  # for alpha inference
-    infer_alpha = True if alpha is None else False
-    alpha = 0.01 if alpha is None else alpha
-    a_gamma = 2
-    b_gamma = 4
+    cluster_means = None
+    cluster_cov = None
     alphas = np.empty(max_iter)
     for it in range(max_iter):
         for n in range(ndata):
@@ -85,6 +109,8 @@ def run_mcmc(data: np.ndarray, alpha: float = None, max_iter: int = 1000, sd: fl
 
             z[n] = -1  # ensures z[n] doesn't get counted as a cluster
             log_weights = np.empty(n_clusters + 1)
+            cluster_means = np.empty((n_clusters, 2))
+            cluster_cov = np.empty((n_clusters, 2, 2))
             # find the unnormalized log probabilities
             # for each existing cluster
             for c in range(n_clusters):
@@ -98,6 +124,10 @@ def run_mcmc(data: np.ndarray, alpha: float = None, max_iter: int = 1000, sd: fl
 
                 c_mean = c_sig @ (prec @ sum_data.T + prec0 @ mu0.T)  # BDA3 3.5 MULTIVARIATE NORMAL MODEL WITH KNOWN VARIANCE
                 log_weights[c] = np.log(counts[c]) + normal_logpdf(data[n, :], c_mean, c_sig + sig)  # (3.7)
+                if (it == max_iter - 1) and (n == ndata - 1):
+                    cluster_means[c, :] = c_mean
+                    cluster_cov[c, :, :] = c_sig + sig
+
 
             # find the unnormalized log probability
             # for the "new" cluster
@@ -136,11 +166,11 @@ def run_mcmc(data: np.ndarray, alpha: float = None, max_iter: int = 1000, sd: fl
             else:
                 alpha = np.random.gamma(a_gamma + n_clusters - 1, 1 / (b_gamma - np.log(z_temp)))
 
-    return z, final_loc_probs, alphas
+    return z, final_loc_probs, alphas, cluster_means, cluster_cov
 
 
-@nb.jit(nopython=True)
-def run_mcmc_mvn_normal_invwishart(data: np.ndarray, alpha: float = None, max_iter: int = 1000, sd: float = 1, sig0: float = 3.0):
+@nb.jit(nopython=True, fastmath=True)
+def run_mcmc_mvn_normal_invwishart(data: np.ndarray, alpha: float = None, max_iter: int = 1000, sig0: float = 3.0, kappa_0=0.01):
     """
     Fast implementation of the algorithm 3 of Neal (2000) with extension to hyperparameter inference for alpha
 
@@ -152,14 +182,11 @@ def run_mcmc_mvn_normal_invwishart(data: np.ndarray, alpha: float = None, max_it
     :return:
     """
 
-    lam = 1
-    nu = 2
+    nu_0 = 2
     final_loc_probs = {}
     data_dim = data.shape[1]  # dimension of the data points
-    sig = np.eye(data_dim) * sd ** 2  # cluster-specific covariance matrix
-    sig0 = np.eye(data_dim) * sig0 ** 2  # prior covariance matrix TODO: fix me
-    prec = np.linalg.inv(sig)
-    prec0 = np.linalg.inv(sig0)
+    # sig = np.eye(data_dim) * sig0 ** 2 / kappa_0  # cluster-specific covariance matrix
+    sig0 = np.eye(data_dim) * sig0 ** 2  # prior covariance matrix
     mu0 = np.array([0.0, 0.0])  # prior mean on cluster parameters
     ndata = int(data.shape[0])  # number of data points
     z = np.zeros(data.shape[0], dtype=np.int64)  # initial cluster assignments
@@ -170,6 +197,8 @@ def run_mcmc_mvn_normal_invwishart(data: np.ndarray, alpha: float = None, max_it
     alpha = 0.01 if alpha is None else alpha
     a_gamma = 2
     b_gamma = 4
+    cluster_means = None
+    cluster_cov = None
     alphas = np.empty(max_iter)
     for it in range(max_iter):
         for n in range(ndata):
@@ -185,6 +214,8 @@ def run_mcmc_mvn_normal_invwishart(data: np.ndarray, alpha: float = None, max_it
 
             z[n] = -1  # ensures z[n] doesn't get counted as a cluster
             log_weights = np.empty(n_clusters + 1)
+            cluster_means = np.empty((n_clusters, 2))
+            cluster_cov = np.empty((n_clusters, 2, 2))
             # find the unnormalized log probabilities
             # for each existing cluster
             for c in range(n_clusters):
@@ -202,17 +233,20 @@ def run_mcmc_mvn_normal_invwishart(data: np.ndarray, alpha: float = None, max_it
 
                 s = np.sum(temp, axis=0)
                 n_c = counts[c]
-                c_sig = sig0 + s + (lam * n_c / (lam + n_c)) * np.outer((c_bar - mu0), (c_bar - mu0))
-                lam_n = lam + n_c
-                nu_n = nu + n_c
-                c_sig = c_sig / (lam_n * (nu_n - 2 + 1))
+                c_sig = sig0 + s + (kappa_0 * n_c / (kappa_0 + n_c)) * np.outer((c_bar - mu0), (c_bar - mu0))
+                kappa_n = kappa_0 + n_c
+                nu_n = nu_0 + n_c
+                c_sig = c_sig * (kappa_n + 1) / (kappa_n * (nu_n - 2 + 1))
                 # BDA3 3.6 MULTIVARIATE NORMAL MODEL WITH UN KNOWN MEAN AND VARIANCE
-                c_mean = (lam * mu0 + n_c * c_bar) / (lam + n_c)
+                c_mean = (kappa_0 * mu0 + n_c * c_bar) / (kappa_0 + n_c)
                 log_weights[c] = np.log(counts[c]) + t_logpdf(data[n, :], c_mean, c_sig, nu_n - 1)
+                if (it == max_iter - 1) and (n == ndata - 1):
+                    cluster_means[c, :] = c_mean
+                    cluster_cov[c, :, :] = c_sig
 
             # find the unnormalized log probability
             # for the "new" cluster
-            log_weights[n_clusters] = np.log(alpha) + t_logpdf(data[n, :], mu0, sig0 + sig, nu)
+            log_weights[n_clusters] = np.log(alpha) + t_logpdf(data[n, :], mu0, (kappa_0 + 1) / (kappa_0 * (nu_0 - 2 + 1)) * sig0, nu_0)
             # transform unnormalized log probabilities
             # into probabilities
             max_weight = np.max(log_weights)
@@ -247,7 +281,7 @@ def run_mcmc_mvn_normal_invwishart(data: np.ndarray, alpha: float = None, max_it
             else:
                 alpha = np.random.gamma(a_gamma + n_clusters - 1, 1 / (b_gamma - np.log(z_temp)))
 
-    return z, final_loc_probs, alphas
+    return z, final_loc_probs, alphas, cluster_means, cluster_cov
 
 
 class CRPGibbs:
